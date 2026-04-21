@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: SPCTOM
+Version: 0.1.0
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
+# SPCTOM
+Implementation of **SPCTOM: Smooth Path-Constrained Time-Optimal Motion** trajectory planning.  
+Course Project **EE6412: Optimal Control**.  
+Inspired from reference paper: _Smooth and Time-Optimal Trajectory Planning for Industrial Manipulators along Specified Paths - D. Constantinescu, E. A. Croft_
