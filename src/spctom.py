@@ -6,350 +6,59 @@ Implements an adapted version of smooth path-constrained time-optimal motion pla
 # Imports
 import numpy as np
 from scipy.interpolate import CubicSpline
-from typing import Any
 
+from src.tom import TOM
+    
 
-class SPCTOM:
+class SPCTOM(TOM):
     """
     Class for path-constrained time-optimal motion planning (PCTOM).
     """
     def __init__(self, robot=None, path_param=None, s_values=None,
                  T_max=None, T_min=None, T_dot_max=None, T_dot_min=None,
                  boundary_conditions=None, ds=None):
-        # Keep explicit attrs for static analyzers and safe defaults.
-        self.robot: Any = None
-        self.path_param: Any = None
-        self.s_values: Any = None
-        self.ds = ds
-        self.boundary_conditions: Any = None
-        self.T_max: Any = None
-        self.T_min: Any = None
-        self.T_dot_max: Any = None
-        self.T_dot_min: Any = None
-        self.q_cache = {}
         self.T_coeffs_cache = {}
         self.T_dot_coeffs_cache = {}
-        self.s_knots: Any = None
-        self.v_init: Any = None
-        self.v_bounds: Any = None
-
-        # Optional direct construction in one call.
-        if robot is not None and path_param is not None and s_values is not None:
-            self.setup(
-                robot=robot,
-                path_param=path_param,
-                s_values=s_values,
-                T_max=T_max,
-                T_min=T_min,
-                T_dot_max=T_dot_max,
-                T_dot_min=T_dot_min,
-                boundary_conditions=boundary_conditions,
-            )
-    def q_s(self, s, q_prev=None):
-        """
-        Compute joint configuration q(s) along the path for path parameter s.
-        """
-        r_s = self.path_param.compute_r_s(s)
-        if q_prev is None:
-            # Reuse the nearest cached IK solution when available; otherwise
-            # fall back to a neutral seed. This is more stable than always
-            # starting from zeros for position-only IK.
-            if self.q_cache:
-                nearest_s = min(self.q_cache.keys(), key=lambda s0: abs(float(s0) - float(s)))
-                q_prev = self.q_cache[nearest_s]
-            else:
-                q_prev = np.zeros(self.robot.n_joints())
-        q = self.robot.inverse_kinematics(r_s, q0=q_prev)
-        self.q_cache[s] = q
-        return q
-    
-    def dq_ds(self, s, q_s):
-        """
-        Compute joint velocity dq/ds at path parameter s given q(s).
-        Uses the position rows of the Jacobian (first 3) and pinv for the
-        minimum-norm solution (handles redundancy in Planar3R).
-        """
-        J_pos = self.robot.jacobian(q_s)[:3, :]
-        dr_ds = self.path_param.compute_dr_ds(s)
-        return np.linalg.pinv(J_pos) @ dr_ds
-    
-    def d2q_ds2(self, s, q_s, dq_ds):
-        """
-        Compute joint acceleration d²q/ds² at path parameter s given q(s) and dq/ds.
-        Uses numerical dJ/ds and pinv for minimum-norm solution.
-        """
-        J_pos   = self.robot.jacobian(q_s)[:3, :]              # 3×n
-        dJ_ds   = self.robot.jacobian_derivative(q_s, dq_ds)[:3, :]   # 3×n
-        d2r_ds2 = self.path_param.compute_d2r_ds2(s)              # 3-vector
-        rhs = d2r_ds2 - dJ_ds @ dq_ds
-        return np.linalg.pinv(J_pos) @ rhs
-    
-    def get_T(self, q, dq, ddq):
-        q = np.asarray(q).flatten()
-        dq = np.asarray(dq).flatten()
-        ddq = np.asarray(ddq).flatten()
-        return self.robot.torque(q, dq, ddq)
-    
-    def get_T_coeffs(self, s):
-        '''
-        Return the coefficients a(s), b(s), c(s) for the torque equation:
-        T = a(s)·s̈ + b(s)·ṡ² + c(s)
-        where:
-        a(s) = M(q).q'
-        b(s) = M(q).q'' + q'T C(q, q)
-        c(s) = G(q)
-        '''
-        q = self.q_s(s)
-        qp = self.dq_ds(s, q)
-        qpp = self.d2q_ds2(s, q, qp)
-        # Get params
-        M = self.robot.mass_matrix(q)
-        # C = self.robot.coriolis(q, qp)
-        G = self.robot.gravity(q)
-        a_s = M @ qp
-        # b_s = M @ qpp + C @ qp
-        c_s = G
-        # Backend-agnostic computation for b(s):
-        # at sdot=1, sddot=0 => dq = qp, ddq = qpp and T = b + c
-        T_unit = self.robot.torque(q, qp, qpp)
-        b_s = T_unit - c_s
-        return a_s, b_s, c_s
-
-    def get_T_dot(self, q, dq, ddq, dddq, dt=1e-6):
-        '''
-        Computes troque rate numerically using forward Euler.
-        Analytical computation from thrd-order dynamics increases complexity with robot matrix derivatives
-        '''
-        q_next = q + dq * dt
-        dq_next = dq + ddq * dt
-        ddq_next = ddq + dddq * dt
-        T1 = self.get_T(q, dq, ddq)
-        T2 = self.get_T(q_next, dq_next, ddq_next)
-        return (T2 - T1) / dt
-    
-    def get_T_dot_coeffs(self, s):
-        '''
-        Return the coefficients a(s), b(s), c(s), d(s) for the torque rate equation:
-        Ṫ = a(s)·s̈̇ + b(s)·ṡ·s̈ + c(s)·ṡ³ + d(s)·ṡ
-        where:
-        a(s) = M.q'
-        b(s) = 3.M.q'' + dM/ds.q' + 2.q'T.C.q'
-        c(s) = M.q''\' + dM/ds.q'' + q''T.C.q' + q'T.dC/ds.q' + q'T.C.q''
-        d(s) = dG/ds
-        '''
-        q = self.q_s(s)
-        qp = self.dq_ds(s, q)
-        qpp = self.d2q_ds2(s, q, qp)
-        
-        # We find the coeffs via probing the polynomail (numerical)
-        # Helper
-        def T_dot_eval(sdot, sddot, sdddot):
-            dq = qp * sdot
-            ddq = qp * sddot + qpp * sdot**2
-            dddq = qp * sdddot + 3 * qpp * sdot * sddot # The q''' term is often ignored to simplfiy complexity. Its value is usually lower.
-            return self.get_T_dot(q, dq, ddq, dddq)
-        
-        a_s = T_dot_eval(0, 0, 1)
-        c_s = (T_dot_eval(2, 0, 0) - 2 * T_dot_eval(1, 0, 0)) / 6
-        d_s = T_dot_eval(1, 0, 0) - c_s
-        b_s = T_dot_eval(1, 1, 0) - d_s - c_s
-        return a_s, b_s, c_s, d_s
-    
-    def _sddot_bounds_from_T(self, a_s, b_s, c_s, tau_min, tau_max, sdot):
-        """
-        Compute sddot bounds for given sdot from torque constraint
-        """
-        sddot_bounds = []
-
-        for i in range(len(a_s)): # Across joints
-            ai, bi, ci = a_s[i], b_s[i], c_s[i]
-
-            if abs(ai) < 1e-8:
-                # If ai is zero, the constraint is independent of sddot. Check if it's satisfied.
-                tau_i = bi * sdot**2 + ci
-                if tau_i < tau_min[i] or tau_i > tau_max[i]:
-                    return np.nan, np.nan  # No feasible sddot
-                else:
-                    continue  # This joint does not constrain sddot
-
-            # Compute bounds
-            ub = (tau_max[i] - bi * sdot**2 - ci) / ai
-            lb = (tau_min[i] - bi * sdot**2 - ci) / ai
-
-            if ai > 0:
-                sddot_bounds.append((lb, ub))
-            else:
-                # flip inequalities
-                sddot_bounds.append((ub, lb))
-
-        sddot_min = max([bound[0] for bound in sddot_bounds])
-        sddot_max = min([bound[1] for bound in sddot_bounds])
-
-        return sddot_min, sddot_max
-
-    def _sdot_max_from_T(self, a_s, b_s, c_s, tau_min, tau_max, sdot_upper=100.0, tol=1e-6):
-        """
-        The maximum sdot is the largest value such that sddot_min <= sddot_max. We can find it by scanning sdot and checking feasibility of sddot bounds via binary search. Could be brittle in the sense i have to put an upper bound and tolerance, but it is more robust than trying to solve the quartic equation for the intersection of the constraints.
-        """
-        low = 0.0
-        high = sdot_upper
-
-        def is_feasible(sdot):
-            sddot_min, sddot_max = self._sddot_bounds_from_T(a_s, b_s, c_s, tau_min, tau_max, sdot)
-            return sddot_min <= sddot_max
-
-        # binary search
-        for _ in range(100):
-            mid = 0.5 * (low + high)
-            if is_feasible(mid):
-                low = mid
-            else:
-                high = mid
-        return low
-
-    def _sdddot_bounds_from_Tdot(self, a_s, b_s, c_s, d_s, tdot_min, tdot_max, sddot, sdot):
-        """
-        Compute sdddot bounds from torque rate constraints given sddot and sdot.
-        Tdot_min <= a sdddot + b sdot sddot + c sdot^3 + d sdot <= Tdot_max
-        """
-        sdddot_bounds = []
-        for i in range(len(a_s)): # Across joints
-            ai, bi, ci, di = a_s[i], b_s[i], c_s[i], d_s[i]
-
-            if abs(ai) < 1e-8:
-                # If ai is zero, the constraint is independent of sdddot. Check if it's satisfied.
-                tdot_i = bi * sdot * sddot + ci * sdot**3 + di * sdot
-                if tdot_i < tdot_min[i] or tdot_i > tdot_max[i]:
-                    return np.nan, np.nan  # No feasible sdddot
-                else:
-                    continue  # This joint does not constrain sddot
-
-            # Compute bounds
-            ub = (tdot_max[i] - bi * sdot * sddot - ci * sdot**3 - di * sdot) / ai
-            lb = (tdot_min[i] - bi * sdot * sddot - ci * sdot**3 - di * sdot) / ai
-
-            if ai > 0:
-                sdddot_bounds.append((lb, ub))
-            else:
-                # flip inequalities
-                sdddot_bounds.append((ub, lb))
-
-        sdddot_min = max([bound[0] for bound in sdddot_bounds])
-        sdddot_max = min([bound[1] for bound in sdddot_bounds])
-
-        return sdddot_min, sdddot_max
-    
-    def _is_feasible_T_and_Tdot(self, a_T, b_T, c_T, a_dT, b_dT, c_dT, d_dT, tau_min, tau_max, tdot_min, tdot_max, sdot):
-        """
-        Check if there exists a feasible sddot that satisfies both torque and torque-rate constraints at given sdot.
-        """
-
-        sddot_min, sddot_max = self._sddot_bounds_from_T(
-            a_T, b_T, c_T, tau_min, tau_max, sdot
+        super().__init__(
+            path_param=path_param,
+            robot=robot,
+            s_values=s_values,
+            T_max=T_max,
+            T_min=T_min,
+            T_dot_max=T_dot_max,
+            T_dot_min=T_dot_min,
+            boundary_conditions=boundary_conditions,
+            ds=ds,
         )
 
-        if not (sddot_min <= sddot_max):
-            return False
-
-        # sample a few candidate accelerations; how many to sample is a tradeoff between accuracy and speed. In practice, the bounds often collapse quickly as sdot increases, so we don't need many samples to check feasibility. TODO
-
-        for alpha in np.linspace(0.0, 1.0, 5):
-            sddot = sddot_min + alpha * (sddot_max - sddot_min)
-
-            sdddot_min, sdddot_max = self._sdddot_bounds_from_Tdot(a_dT, b_dT, c_dT, d_dT, tdot_min, tdot_max, sddot, sdot)
-
-            if sdddot_min <= sdddot_max:
-                return True
-
-        return False
-
-    def _sdot_max_from_T_and_Tdot(self, a_T, b_T, c_T, a_dT, b_dT, c_dT, d_dT,
-                                tau_min, tau_max, tdot_min, tdot_max,
-                                sdot_upper=1.0, max_expand=8):
-
-        def is_feasible(sdot):
-            return self._is_feasible_T_and_Tdot(a_T, b_T, c_T, a_dT, b_dT, c_dT, d_dT, tau_min, tau_max, tdot_min, tdot_max, sdot)
-
-        low = 0.0
-        high = float(max(sdot_upper, 1e-3))
-
-        # Expand upper bound until infeasible (or until max_expand attempts)
-        for _ in range(max_expand):
-            if is_feasible(high):
-                low = high
-                high *= 2.0
-            else:
-                break
-
-        # binary search
-        for _ in range(100):
-            mid = 0.5 * (low + high)
-            if is_feasible(mid):
-                low = mid
-            else:
-                high = mid
-        return low
-
-    def compute_tau_s(self, s, sdot, sddot):
-        A, B, C = self.get_T_coeffs(s)
-        return A * sddot + B * sdot**2 + C
-    
-    def compute_tau_dot_s(self, s, sdot, sddot, sdddot):
-        a_s, b_s, c_s, d_s = self.get_T_dot_coeffs(s)
-        return a_s * sdddot + b_s * sdot * sddot + c_s * sdot**3 + d_s * sdot
-    
-    def setup(self, robot, path_param, s_values, T_max=None, T_min=None, T_dot_max=None, T_dot_min=None, boundary_conditions=None):
-        """
-        Setup planner for given problem
-        """
-
-        # Pre-inits
-        self.robot = robot
-
-        # Objective will be setup by passing to solve()
-
-        # Boundary conditions
-        self.boundary_conditions = boundary_conditions
-
-        # path constraint - path setup by other class PathParametrize. Here only initialize
-        self.s_values = s_values
-        self.path_param = path_param
-
-        # Setup torque and torque-rate limits
-        self.T_max = T_max
-        self.T_min = T_min
-        self.T_dot_max = T_dot_max
-        self.T_dot_min = T_dot_min
-        # If torque limits are not provided, assume infinite (unconstrained)
-        if self.T_max is None:
-            self.T_max = np.ones(self.robot.n_joints()) * np.inf
-        if self.T_min is None:
-            self.T_min = -np.ones(self.robot.n_joints()) * np.inf
-        if self.T_dot_max is None:
-            self.T_dot_max = np.ones(self.robot.n_joints()) * np.inf
-        if self.T_dot_min is None:
-            self.T_dot_min = -np.ones(self.robot.n_joints()) * np.inf
-        self.T_max = np.asarray(self.T_max, dtype=float)
-        self.T_min = np.asarray(self.T_min, dtype=float)
-        self.T_dot_max = np.asarray(self.T_dot_max, dtype=float)
-        self.T_dot_min = np.asarray(self.T_dot_min, dtype=float)
-        
-        # Misc.
-        self.q_cache = {}  # Cache for q(s) to avoid redundant IK calls
-
-
-        # Get T dot coeffs
-        self.T_dot_coeffs_cache = {}
-        for s in s_values:
-            self.T_dot_coeffs_cache[float(s)] = self.get_T_dot_coeffs(float(s))
-        
-        # Get T coeffs
-        self.T_coeffs_cache = {}
-        for s in s_values:
-            self.T_coeffs_cache[float(s)] = self.get_T_coeffs(float(s))
-
-        # Actual setup defaults for optimisation variables.
+        self._prime_dynamics_caches()
         self._set_default_knots_and_guess(num_knots=20)
+
+    def _cache_key(self, s):
+        return float(s)
+
+    def _prime_dynamics_caches(self):
+        for s in np.asarray(self.s_values, dtype=float):
+            self.get_T_coeffs(float(s))
+            self.get_T_dot_coeffs(float(s))
+
+    def _get_T_coeffs_cached(self, s):
+        key = self._cache_key(s)
+        if key not in self.T_coeffs_cache:
+            self.T_coeffs_cache[key] = super().get_T_coeffs(key)
+        return self.T_coeffs_cache[key]
+
+    def _get_T_dot_coeffs_cached(self, s):
+        key = self._cache_key(s)
+        if key not in self.T_dot_coeffs_cache:
+            self.T_dot_coeffs_cache[key] = super().get_T_dot_coeffs(key)
+        return self.T_dot_coeffs_cache[key]
+
+    def get_T_coeffs(self, s):
+        return self._get_T_coeffs_cached(s)
+
+    def get_T_dot_coeffs(self, s):
+        return self._get_T_dot_coeffs_cached(s)
 
     def _set_default_knots_and_guess(self, num_knots=20):
         """Fallback uniform knots + conservative initial speed profile."""
@@ -364,6 +73,9 @@ class SPCTOM:
         Warm-start SPCTOM from PCTOM trajectory:
         - knot locations from switching points + uniform fill
         - initial knot speeds by interpolation of PCTOM sdot(s)
+        
+        NOTE: If the PCTOM trajectory violates torque-rate constraints too severely,
+        falls back to default conservative initialization to ensure a feasible starting point.
         """
         s_knots = build_knots_from_pctom(
             pctom_result,
@@ -389,14 +101,299 @@ class SPCTOM:
         v_u = v_pct[idx_u]
 
         self.s_knots = s_knots
-        self.v_init = np.interp(self.s_knots, s_u, v_u, left=v_u[0], right=v_u[-1])
-        self.v_init = np.maximum(self.v_init, 1e-6)
-        self.v_init[0] = max(float(v_u[0]), 1e-6)
-        self.v_init[-1] = max(float(v_u[-1]), 1e-6)
-        self.v_bounds = [(1e-6, None) for _ in self.s_knots]
+        v_init_candidate = np.interp(self.s_knots, s_u, v_u, left=v_u[0], right=v_u[-1])
+        v_init_candidate = np.maximum(v_init_candidate, 1e-6)
+        v_init_candidate[0] = max(float(v_u[0]), 1e-6)
+        v_init_candidate[-1] = max(float(v_u[-1]), 1e-6)
+
+        # Test if the interpolated profile is feasible enough
+        # Sample the candidate spline and check torque-rate violations
+        # Use 'natural' BC to avoid overshoot artifacts from PCTOM discontinuities
+        # Avoid exact boundaries where path geometry may be singular
+        sp_test = CubicSpline(self.s_knots, v_init_candidate, bc_type='natural')
+        s_test = np.linspace(self.s_knots[0] + 0.01 * (self.s_knots[-1] - self.s_knots[0]),
+                            self.s_knots[-1] - 0.01 * (self.s_knots[-1] - self.s_knots[0]),
+                            50)
+        sdot_test = np.maximum(sp_test(s_test), 1e-9)
+        dsdot_ds_test = sp_test(s_test, 1)
+        d2sdot_ds2_test = sp_test(s_test, 2)
+        sddot_test = dsdot_ds_test * sdot_test
+        sdddot_test = sdot_test * (dsdot_ds_test**2 + sdot_test * d2sdot_ds2_test)
+        
+        # Check Tdot constraint violation
+        Tdot_vio_max = 0.0
+        for i, s in enumerate(s_test):
+            a_Tdot, b_Tdot, c_Tdot, d_Tdot = self.get_T_dot_coeffs(float(s))
+            tau_dot_joint = (a_Tdot * sdddot_test[i] + 
+                            b_Tdot * sdot_test[i] * sddot_test[i] +
+                            c_Tdot * (sdot_test[i]**3) +
+                            d_Tdot * sdot_test[i])
+            for j in range(self.robot.n_joints()):
+                if self.T_dot_max[j] < np.inf and self.T_dot_max[j] > 0:
+                    v = tau_dot_joint[j] / self.T_dot_max[j] - 1.0
+                    Tdot_vio_max = max(Tdot_vio_max, v)
+                if self.T_dot_min[j] > -np.inf and self.T_dot_min[j] < 0:
+                    v = tau_dot_joint[j] / self.T_dot_min[j] - 1.0
+                    Tdot_vio_max = max(Tdot_vio_max, v)
+        
+        if Tdot_vio_max > 50.0:
+            # PCTOM trajectory has severe T_dot violations.
+            # Try to adjust by scaling down the profile while preserving structure.
+            print(f"[warm_start_from_pctom] PCTOM trajectory has Tdot_violation={Tdot_vio_max:.1e} >> 50.0.")
+            print(f"[warm_start_from_pctom] Attempting constrained adjustment to satisfy T_dot constraints...")
+            
+            adjusted = self._adjust_profile_for_tdot_constraints(
+                v_init_candidate, self.s_knots, target_vio=1.0, max_iterations=30
+            )
+            if adjusted is not None:
+                self.v_init = adjusted
+                self.v_bounds = [(1e-6, None) for _ in self.s_knots]
+                print(f"[warm_start_from_pctom] Successfully adjusted warm-start to satisfy T_dot constraints.")
+            else:
+                # If adjustment fails, fall back to conservative initialization
+                print(f"[warm_start_from_pctom] Adjustment failed. Falling back to conservative default initialization.")
+                self._set_default_knots_and_guess(num_knots=max(20, len(s_knots)))
+        else:
+            self.v_init = v_init_candidate
+            self.v_bounds = [(1e-6, None) for _ in self.s_knots]
+
+    def _measure_tdot_violation(self, v_knots, s_knots=None, n_samples=50):
+        """
+        Measure maximum T_dot constraint violation for a given speed profile.
+        
+        Use natural boundary conditions (second derivative = 0 at boundaries) to avoid
+        oscillations. Avoid evaluating exactly at s=0 and s=1 boundaries where geometry
+        may be singular.
+        
+        Returns: (max_violation, details_dict)
+        """
+        if s_knots is None:
+            s_knots = self.s_knots
+        
+        # Use 'natural' boundary condition to avoid overshoot at boundaries
+        sp = CubicSpline(s_knots, v_knots, bc_type='natural')
+        # Avoid exact boundaries where path geometry may be singular
+        s_test = np.linspace(s_knots[0] + 0.01 * (s_knots[-1] - s_knots[0]),
+                            s_knots[-1] - 0.01 * (s_knots[-1] - s_knots[0]),
+                            n_samples)
+        sdot = np.maximum(sp(s_test), 1e-9)
+        dsdot_ds = sp(s_test, 1)
+        d2sdot_ds2 = sp(s_test, 2)
+        sddot = dsdot_ds * sdot
+        sdddot = sdot * (dsdot_ds**2 + sdot * d2sdot_ds2)
+        
+        max_vio = 0.0
+        for i, s in enumerate(s_test):
+            a_Tdot, b_Tdot, c_Tdot, d_Tdot = self.get_T_dot_coeffs(float(s))
+            tau_dot_joint = (a_Tdot * sdddot[i] + 
+                            b_Tdot * sdot[i] * sddot[i] +
+                            c_Tdot * (sdot[i]**3) +
+                            d_Tdot * sdot[i])
+            for j in range(self.robot.n_joints()):
+                if self.T_dot_max[j] < np.inf and self.T_dot_max[j] > 0:
+                    v = tau_dot_joint[j] / self.T_dot_max[j] - 1.0
+                    max_vio = max(max_vio, v)
+                if self.T_dot_min[j] > -np.inf and self.T_dot_min[j] < 0:
+                    v = tau_dot_joint[j] / self.T_dot_min[j] - 1.0
+                    max_vio = max(max_vio, v)
+        
+        return max_vio, {'max_vio': max_vio, 'n_samples': n_samples}
+
+    def _adjust_profile_for_tdot_constraints(self, v_init_candidate, s_knots, 
+                                            target_vio=1.0, max_iterations=30):
+        """
+        Adjust PCTOM speed profile to satisfy T_dot constraints.
+        
+        Strategy: Binary search on a global scaling factor that reduces ALL speeds
+        uniformly (including boundaries) while maintaining the relative profile shape.
+        Find a scaling where T_dot violations are acceptable (near target_vio).
+        
+        Returns: Adjusted speed profile, or None if adjustment fails.
+        """
+        # Binary search on global scaling factor
+        scale_min = 1e-5
+        scale_max = 1.0
+        best_scale = None
+        best_vio = np.inf
+        
+        for iteration in range(max_iterations):
+            scale_mid = 0.5 * (scale_min + scale_max)
+            v_test = np.maximum(v_init_candidate * scale_mid, 1e-6)
+            
+            vio, _ = self._measure_tdot_violation(v_test, s_knots, n_samples=50)
+            
+            if abs(vio - target_vio) < best_vio:
+                best_vio = abs(vio - target_vio)
+                best_scale = scale_mid
+            
+            # If violation is acceptable (near 0 or within tolerance), accept this scale
+            if vio <= target_vio:
+                # Found a feasible solution, try to go higher
+                scale_min = scale_mid
+            else:
+                # Too many violations, need to go lower
+                scale_max = scale_mid
+            
+            # Check for convergence
+            if abs(scale_max - scale_min) < 1e-8 or iteration > max_iterations - 1:
+                break
+        
+        if best_scale is not None and best_scale > 1e-4:
+            v_adjusted = np.maximum(v_init_candidate * best_scale, 1e-6)
+            return v_adjusted
+        
+        return None
 
     def _build_spline(self, sdot_knots):
-        return CubicSpline(self.s_knots, sdot_knots, bc_type='clamped')
+        return CubicSpline(self.s_knots, sdot_knots, bc_type='not-a-knot')
+
+    def _check_and_fix_warm_start_feasibility(self, verbose=False):
+        """
+        Check if warm-start initial guess is feasible. If infeasible,
+        find a uniform conservative speed that IS feasible.
+        
+        Returns: (did_modify, original_v_init, final_v_init)
+        """
+        # Build initial spline and sample it
+        sp_test = self._build_spline(np.array(self.v_init, dtype=float))
+        s_check = np.linspace(self.s_knots[0], self.s_knots[-1], 100)
+        sdot = np.maximum(sp_test(s_check), 1e-9)
+        sdot_deriv = sp_test(s_check, 1)
+        sdot_deriv2 = sp_test(s_check, 2)
+        sddot = sdot_deriv * sdot
+        sdddot = sdot * (sdot_deriv**2 + sdot * sdot_deriv2)
+
+        # Compute torque constraint violations
+        T_vio = 0.0
+        a_T = np.zeros((len(s_check), self.robot.n_joints()))
+        b_T = np.zeros_like(a_T)
+        c_T = np.zeros_like(a_T)
+        for i, s in enumerate(s_check):
+            a_T[i], b_T[i], c_T[i] = self.get_T_coeffs(float(s))
+        tau = a_T * sddot[:, None] + b_T * (sdot[:, None]**2) + c_T
+        for j in range(self.robot.n_joints()):
+            if self.T_max[j] < np.inf:
+                v = tau[:, j] / self.T_max[j] - 1.0
+                T_vio = max(T_vio, np.max(v))
+            if self.T_min[j] > -np.inf:
+                v = tau[:, j] / self.T_min[j] - 1.0
+                T_vio = max(T_vio, np.max(v))
+
+        # Compute torque-rate constraint violations
+        Tdot_vio = 0.0
+        a_Tdot = np.zeros((len(s_check), self.robot.n_joints()))
+        b_Tdot = np.zeros_like(a_Tdot)
+        c_Tdot = np.zeros_like(a_Tdot)
+        d_Tdot = np.zeros_like(a_Tdot)
+        for i, s in enumerate(s_check):
+            a_Tdot[i], b_Tdot[i], c_Tdot[i], d_Tdot[i] = self.get_T_dot_coeffs(float(s))
+        tau_dot = (a_Tdot * sdddot[:, None] + 
+                   b_Tdot * (sdot[:, None] * sddot[:, None]) +
+                   c_Tdot * (sdot[:, None]**3) +
+                   d_Tdot * sdot[:, None])
+        for j in range(self.robot.n_joints()):
+            if self.T_dot_max[j] < np.inf:
+                v = tau_dot[:, j] / self.T_dot_max[j] - 1.0
+                Tdot_vio = max(Tdot_vio, np.max(v))
+            if self.T_dot_min[j] > -np.inf:
+                v = tau_dot[:, j] / self.T_dot_min[j] - 1.0
+                Tdot_vio = max(Tdot_vio, np.max(v))
+
+        max_vio = max(T_vio, Tdot_vio)
+        original_v_init = self.v_init.copy()
+
+        if max_vio > 100.0:  # If massively infeasible
+            if verbose:
+                print(f"[SPCTOM] Warm-start is severely infeasible (max_vio={max_vio:.1e}). "
+                      f"Finding feasible uniform scaling...")
+            
+            # Binary search for a uniform speed v such that v * v_init is feasible
+            original_mean = np.mean(original_v_init[1:-1])  # Exclude boundaries
+            v_max = min(1.0, original_mean)
+            v_min = 1e-5
+            
+            for _ in range(20):
+                v_mid = 0.5 * (v_min + v_max)
+                v_test = original_v_init * v_mid
+                v_test = np.maximum(v_test, 1e-6)
+                v_test[0] = original_v_init[0] * v_mid
+                v_test[-1] = original_v_init[-1] * v_mid
+                
+                sp_test_scaled = self._build_spline(v_test)
+                sdot_test = np.maximum(sp_test_scaled(s_check), 1e-9)
+                sdot_deriv_test = sp_test_scaled(s_check, 1)
+                sdot_deriv2_test = sp_test_scaled(s_check, 2)
+                sddot_test = sdot_deriv_test * sdot_test
+                sdddot_test = sdot_test * (sdot_deriv_test**2 + sdot_test * sdot_deriv2_test)
+                
+                # Check feasibility of scaled guess
+                vio_test = 0.0
+                a_T_test = np.zeros((len(s_check), self.robot.n_joints()))
+                b_T_test = np.zeros_like(a_T_test)
+                c_T_test = np.zeros_like(a_T_test)
+                for i, s in enumerate(s_check):
+                    a_T_test[i], b_T_test[i], c_T_test[i] = self.get_T_coeffs(float(s))
+                tau_test = a_T_test * sddot_test[:, None] + b_T_test * (sdot_test[:, None]**2) + c_T_test
+                for j in range(self.robot.n_joints()):
+                    if self.T_max[j] < np.inf:
+                        v = tau_test[:, j] / self.T_max[j] - 1.0
+                        vio_test = max(vio_test, np.max(v))
+                    if self.T_min[j] > -np.inf:
+                        v = tau_test[:, j] / self.T_min[j] - 1.0
+                        vio_test = max(vio_test, np.max(v))
+                
+                a_Tdot_test = np.zeros((len(s_check), self.robot.n_joints()))
+                b_Tdot_test = np.zeros_like(a_Tdot_test)
+                c_Tdot_test = np.zeros_like(a_Tdot_test)
+                d_Tdot_test = np.zeros_like(a_Tdot_test)
+                for i, s in enumerate(s_check):
+                    a_Tdot_test[i], b_Tdot_test[i], c_Tdot_test[i], d_Tdot_test[i] = self.get_T_dot_coeffs(float(s))
+                tau_dot_test = (a_Tdot_test * sdddot_test[:, None] + 
+                               b_Tdot_test * (sdot_test[:, None] * sddot_test[:, None]) +
+                               c_Tdot_test * (sdot_test[:, None]**3) +
+                               d_Tdot_test * sdot_test[:, None])
+                for j in range(self.robot.n_joints()):
+                    if self.T_dot_max[j] < np.inf:
+                        v = tau_dot_test[:, j] / self.T_dot_max[j] - 1.0
+                        vio_test = max(vio_test, np.max(v))
+                    if self.T_dot_min[j] > -np.inf:
+                        v = tau_dot_test[:, j] / self.T_dot_min[j] - 1.0
+                        vio_test = max(vio_test, np.max(v))
+                
+                if vio_test < 1.0:  # Found feasible region
+                    v_max = v_mid
+                else:
+                    v_min = v_mid
+            
+            # Use the best scaled version we found
+            scale_final = v_max
+            self.v_init = original_v_init * scale_final
+            self.v_init = np.maximum(self.v_init, 1e-6)
+            self.v_init[0] = original_v_init[0] * scale_final
+            self.v_init[-1] = original_v_init[-1] * scale_final
+            
+            if verbose:
+                print(f"[SPCTOM] Applied scaling factor {scale_final:.4f} to warm-start.")
+            
+            return True, original_v_init, self.v_init
+        elif max_vio > 10.0:  # If moderately infeasible
+            if verbose:
+                print(f"[SPCTOM] Warm-start is moderately infeasible (max_vio={max_vio:.1e}). "
+                      f"Applying 0.5x scaling.")
+            
+            # Scale down by 0.5
+            scale_factor = 0.5
+            self.v_init = original_v_init * scale_factor
+            self.v_init = np.maximum(self.v_init, 1e-6)
+            self.v_init[0] = original_v_init[0] * scale_factor
+            self.v_init[-1] = original_v_init[-1] * scale_factor
+            
+            return True, original_v_init, self.v_init
+        else:
+            if verbose:
+                print(f"[SPCTOM] Warm-start is feasible (max_vio={max_vio:.2e}).")
+            return False, original_v_init, original_v_init
+
 
     def solve(self, max_iter=1000, phi0=0.2, k_phi=0.5, tol=1e-6,
             alpha=1.0, beta=0.5, gamma=2.0, verbose=False, max_wall_time_s=20.0):
@@ -450,14 +447,8 @@ class SPCTOM:
             s_check = s_all[idx]
         else:
             s_check = s_all
-        coeff_T = [self.T_coeffs_cache[float(s)] for s in s_check]
-        coeff_Tdot = [self.T_dot_coeffs_cache[float(s)] for s in s_check]
-        s_all = np.asarray(self.s_values, dtype=float)
-        if s_all.size > 201:
-            idx = np.linspace(0, s_all.size - 1, 201, dtype=int)
-            s_check = s_all[idx]
-        else:
-            s_check = s_all
+        coeff_T = [self._get_T_coeffs_cached(float(s)) for s in s_check]
+        coeff_Tdot = [self._get_T_dot_coeffs_cached(float(s)) for s in s_check]
 
         def objective(x):
             sp = self._build_spline(_apply_bc(x))
@@ -545,19 +536,27 @@ class SPCTOM:
 
         # ─── inner optimisation: bisection line-search  Fig. A.1 ──────────────
         def bisect_to_feasible(x_bad, x_anchor, phi, max_steps=25):
+            # Always bisect toward a point that is known to be feasible at the
+            # current tolerance. The centroid is not guaranteed to satisfy the
+            # constraints, so fall back to the slow-motion anchor when needed.
+            if not is_acceptable(x_anchor, phi):
+                x_anchor = x_slow
+
             lo, hi = 0.0, 1.0
+            best = _apply_bc(x_anchor)
             for _ in range(max_steps):
                 mid   = 0.5 * (lo + hi)
                 x_mid = _apply_bc(x_bad + mid * (x_anchor - x_bad))
                 if is_acceptable(x_mid, phi):
                     hi = mid
+                    best = x_mid
                 else:
                     lo = mid
-            return _apply_bc(x_bad + hi * (x_anchor - x_bad))
+            return _apply_bc(best)
 
         # ─── initialise polyhedron  (n+1 vertices in R^n) ─────────────────────
         x0    = _apply_bc(np.array(self.v_init, dtype=float))
-        x_slow = _apply_bc(np.full(n, 1e-4))   # very slow → always feasible
+        x_slow = _apply_bc(np.full(n, 1e-7))   # ultra-slow anchor → must be feasible
 
         verts = np.empty((n + 1, n))
         verts[0] = x0
@@ -581,6 +580,7 @@ class SPCTOM:
         best_idx = int(np.argmin(f_vals))
         best_x   = verts[best_idx].copy()
         best_f   = f_vals[best_idx]
+        x_best   = best_x.copy()
 
         it = -1
         for it in range(max_iter):
@@ -595,7 +595,7 @@ class SPCTOM:
             # point (very small sdot), which is always feasible.
             for j in range(n + 1):
                 if not is_acceptable(verts[j], phi):
-                    verts[j]  = bisect_to_feasible(verts[j], x_slow, phi)
+                    verts[j]  = bisect_to_feasible(verts[j], x_best, phi)
                     f_vals[j] = objective(verts[j])
                     T_vals[j] = constraint_violation(verts[j])
 
@@ -634,7 +634,7 @@ class SPCTOM:
             x_ref = _apply_bc(x_cen + alpha * (x_cen - x_worst))
 
             if not is_acceptable(x_ref, phi):
-                x_ref = bisect_to_feasible(x_ref, x_cen, phi)
+                x_ref = bisect_to_feasible(x_ref, x_best, phi)
 
             f_ref = objective(x_ref)
             T_ref = constraint_violation(x_ref)
@@ -644,7 +644,7 @@ class SPCTOM:
                 x_exp = _apply_bc(x_cen + gamma * (x_cen - x_worst))
 
                 if not is_acceptable(x_exp, phi):
-                    x_exp = bisect_to_feasible(x_exp, x_ref, phi)
+                    x_exp = bisect_to_feasible(x_exp, x_best, phi)
 
                 f_exp = objective(x_exp)
                 T_exp = constraint_violation(x_exp)
@@ -669,7 +669,7 @@ class SPCTOM:
                 x_con = _apply_bc(x_cen + beta * (x_worst - x_cen))
 
                 if not is_acceptable(x_con, phi):
-                    x_con = bisect_to_feasible(x_con, x_cen, phi)
+                    x_con = bisect_to_feasible(x_con, x_best, phi)
 
                 f_con = objective(x_con)
                 T_con = constraint_violation(x_con)
@@ -701,7 +701,7 @@ class SPCTOM:
             phi_a = k_phi * float(np.max(np.linalg.norm(verts - x_cen, axis=1)))
             phi_b = k_phi * float(np.linalg.norm(x_cen - x_worst))
             phi   = min(phi, phi_a, phi_b)
-            phi   = max(phi, tol * 1e-2)   # floor to avoid premature termination
+            phi   = max(phi, tol * 10)   # floor at the requested tolerance scale
 
         best_x      = _apply_bc(best_x)
         best_spline = self._build_spline(best_x)

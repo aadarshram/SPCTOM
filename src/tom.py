@@ -15,6 +15,10 @@ class TOM:
         n = robot.n_joints()
         self.T_max = np.asarray(T_max, dtype=float) if T_max is not None \
                      else np.full(n,  np.inf)
+        self.T_dot_max = np.asarray(T_dot_max, dtype=float) if T_dot_max is not None \
+                         else np.full(n,  np.inf)
+        self.T_dot_min = np.asarray(T_dot_min, dtype=float) if T_dot_min is not None \
+                         else np.full(n, -np.inf)
         self.T_min = np.asarray(T_min, dtype=float) if T_min is not None \
                      else np.full(n, -np.inf)
         self.ds = ds if ds is not None \

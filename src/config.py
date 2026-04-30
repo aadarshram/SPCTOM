@@ -2,7 +2,7 @@
 import numpy as np
 from pathlib import Path
 
-ROBOT = 'CAR_1DOF' # 'ELBOW_3DOF' or 'CAR_1DOF'
+ROBOT = 'ELBOW_3DOF' # 'ELBOW_3DOF' or 'CAR_1DOF'
 
 # Robot constraints + boundary conditions per robot
 if ROBOT == 'CAR_1DOF':

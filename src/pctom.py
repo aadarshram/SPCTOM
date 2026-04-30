@@ -636,7 +636,7 @@ class PCTOM(TOM):
 
         return self.s_values[-1], None
     
-    def _is_active_constraint(self, idx, s, sdot, tol=1e-4):
+    def _is_active_constraint(self, idx, s, sdot, tol=1e-3):
         """
         Check if constraint i is ACTIVE (i.e., defines the bound).
         """
@@ -655,6 +655,9 @@ class PCTOM(TOM):
         # Evaluate this joint's torque at both accel bounds.
         tau_lo = a[idx] * lo + b[idx] * sdot**2 + c[idx]
         tau_hi = a[idx] * hi + b[idx] * sdot**2 + c[idx]
+
+        # Relative tol
+        tol = tol * self.T_max[idx]
 
         if abs(tau_lo - self.T_max[idx]) < tol or abs(tau_lo - self.T_min[idx]) < tol:
             return True
@@ -802,6 +805,8 @@ class PCTOM(TOM):
             # ------------------------------------------------------------
             s_new, sdot_new = self._step(s, sdot, +1, ds)
             vlc_new = self._sdot_max_at(s_new)
+            sdot_new = min(sdot_new, vlc_new)
+            sdot_new = max(sdot_new, 1e-9)
 
             if sdot_new < vlc_new:
                 # Still below VLC — keep going
@@ -903,6 +908,22 @@ class PCTOM(TOM):
                     sdot=max(float(sdb), 1e-9),
                 )
                 fwd_sddot.append(lo_b)
+
+            # The stitched tail is appended in backward integration order, so
+            # canonicalize the arc before any later searchsorted/interpolation.
+            fwd_s_arr = np.asarray(fwd_s, dtype=float)
+            order = np.argsort(fwd_s_arr, kind='mergesort')
+            fwd_s_arr = fwd_s_arr[order]
+            fwd_sdot_arr = np.asarray(fwd_sdot, dtype=float)[order]
+            fwd_sddot_arr = np.asarray(fwd_sddot, dtype=float)[order]
+
+            # Keep the last occurrence for repeated s values so the stitched
+            # decel segment wins at the crossing point and any duplicate joins.
+            rev_s = fwd_s_arr[::-1]
+            keep = np.concatenate(([True], rev_s[1:] != rev_s[:-1]))[::-1]
+            fwd_s = fwd_s_arr[keep].tolist()
+            fwd_sdot = fwd_sdot_arr[keep].tolist()
+            fwd_sddot = fwd_sddot_arr[keep].tolist()
             
             # Clamp to VLC to avoid numerical issues
             for k in range(len(fwd_sdot)):
