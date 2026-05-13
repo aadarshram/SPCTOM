@@ -81,7 +81,7 @@ The script will:
 
 ## How it works
 
-A detailed explanation of the methods and implementation can be found in the [presentation](LINK TO BE ADDED) and [report](LINK TO BE ADDED).
+A detailed explanation of the methods and implementation can be found in the presentation and report under docs/
 
 ---
 

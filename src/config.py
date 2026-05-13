@@ -22,8 +22,7 @@ else:
 	# 3-DOF elbow manipulator defaults
 	T_MAX = np.array([75, 75, 75], dtype=float)
 	T_MIN = -T_MAX
-	cat = {'High': 3, 'Medium': 2, 'Low': 1}
-	T_DOT_MAX = np.ones_like(T_MAX) * (10 ** cat['High'])
+	T_DOT_MAX = np.ones_like(T_MAX) * (100)
 	T_DOT_MIN = -T_DOT_MAX
 
 	q0 = np.array([0.0, 0.0, 0.0])
